@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import scipy.io as sio
 
 import torch
 import torchvision
@@ -9,16 +10,17 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 class DatasetObject:
-    def __init__(self, dataset, n_client, seed, rule, unbalanced_sgm=0, rule_arg='', data_path=''):
+    def __init__(self, dataset, n_client, seed, rule, unbalanced_sgm=0, rule_arg='', data_path='', split='cross_rep'):
         self.dataset  = dataset
         self.n_client = n_client
         self.rule     = rule
         self.rule_arg = rule_arg
         self.seed     = seed
+        self.split    = split   # 'cross_rep' (benchmark) or 'random' (within-rep 80/20)
         rule_arg_str = rule_arg if isinstance(rule_arg, str) else '%.3f' % rule_arg
-        # self.name = "{:s}_{:s}_{:s}_{:.0f}%-{:d}".format(dataset, rule, str(rule_arg), args.active_ratio*args.total_client, args.total_client)
         self.name = "%s_%d_%d_%s_%s" %(self.dataset, self.n_client, self.seed, self.rule, rule_arg_str)
         self.name += '_%f' %unbalanced_sgm if unbalanced_sgm!=0 else ''
+        self.name += '_randsp' if split == 'random' else ''
         self.unbalanced_sgm = unbalanced_sgm
         self.data_path = data_path
         self.set_data()
@@ -99,8 +101,123 @@ class DatasetObject:
                 test_load = torch.utils.data.DataLoader(testset, batch_size=len(testset), shuffle=False, num_workers=0)
                 self.channels = 3; self.width = 64; self.height = 64; self.n_cls = 200;
             
-            if self.dataset != 'emnist':
-                train_itr = train_load.__iter__(); test_itr = test_load.__iter__() 
+            if self.dataset == 'ninapro':
+                # ------------------------------------------------------------------ #
+                # NinaPro DB2, Exercise B (file E1): 17 hand/wrist movements          #
+                # Preprocessing: bandpass 10-500 Hz + rectification + z-score        #
+                # Window: 400 samples = 200 ms @ 2000 Hz, stride 100 samples = 50 ms #
+                # split='cross_rep': train reps {1,3,4,6}, test reps {2,5} (benchmark)
+                # split='random':    all reps pooled, random 80/20 split by window   #
+                # Rest windows discarded; labels 1-17 remapped to 0-16 -> n_cls=17   #
+                # ------------------------------------------------------------------ #
+                from scipy.signal import butter, filtfilt
+                ninapro_path = os.path.join(self.data_path, 'Data', 'Raw', 'ninapro')
+                WINDOW_SIZE  = 400    # 200 ms at 2000 Hz
+                WINDOW_STEP  = 100    # 50 ms stride
+                N_EMG_CH     = 12
+                N_CLS        = 17
+                FS           = 2000.0
+                self.channels = 1; self.height = N_EMG_CH; self.width = WINDOW_SIZE; self.n_cls = N_CLS
+
+                b_bp, a_bp = butter(4, [10.0 / (FS / 2), 500.0 / (FS / 2)], btype='band')
+
+                TRAIN_REPS = {1, 3, 4, 6}
+                TEST_REPS  = {2, 5}
+
+                n_subjects = min(self.n_client, 40) if self.rule == 'subject' else 40
+
+                per_subject_train_x = []
+                per_subject_train_y = []
+                test_x_list, test_y_list = [], []
+
+                for subj in range(1, n_subjects + 1):
+                    mat_path = os.path.join(ninapro_path, 'DB2_s%d' % subj, 'S%d_E1_A1.mat' % subj)
+                    if not os.path.exists(mat_path):
+                        mat_path = os.path.join(ninapro_path, 'DB2_s%d' % subj, 'DB2_s%d' % subj, 'S%d_E1_A1.mat' % subj)
+                    mat    = sio.loadmat(mat_path)
+                    emg    = mat['emg'].astype(np.float32)
+                    labels = mat['restimulus'].flatten().astype(np.int64)
+                    reps   = mat['rerepetition'].flatten().astype(np.int64)
+
+                    for ch in range(N_EMG_CH):
+                        emg[:, ch] = filtfilt(b_bp, a_bp, emg[:, ch])
+                    emg = np.abs(emg)
+
+                    if self.split == 'random':
+                        # Use all repetitions; z-score on full recording
+                        nz_mask = reps > 0
+                        mean = emg[nz_mask].mean(axis=0, keepdims=True)
+                        std  = emg[nz_mask].std(axis=0, keepdims=True) + 1e-6
+                        emg  = (emg - mean) / std
+
+                        # Window all reps (excluding rest label 0)
+                        all_wx, all_wy = [], []
+                        for s in range(0, len(emg) - WINDOW_SIZE + 1, WINDOW_STEP):
+                            w_emg = emg[s:s + WINDOW_SIZE]
+                            w_lbl = labels[s:s + WINDOW_SIZE]
+                            counts  = np.bincount(w_lbl.astype(np.intp), minlength=18)
+                            maj_lbl = int(np.argmax(counts))
+                            if maj_lbl == 0 or counts[maj_lbl] / WINDOW_SIZE < 0.8:
+                                continue
+                            all_wx.append(w_emg.T[np.newaxis].copy())
+                            all_wy.append(maj_lbl - 1)
+
+                        if len(all_wx) == 0:
+                            continue
+                        all_wx = np.stack(all_wx, axis=0).astype(np.float32)
+                        all_wy = np.array(all_wy, dtype=np.int64)
+
+                        # Random 80/20 split per subject (stratified by class)
+                        np.random.seed(self.seed + subj)
+                        idx = np.arange(len(all_wy))
+                        np.random.shuffle(idx)
+                        n_train = int(0.8 * len(idx))
+                        tr_idx, ts_idx = idx[:n_train], idx[n_train:]
+
+                        per_subject_train_x.append(all_wx[tr_idx])
+                        per_subject_train_y.append(all_wy[tr_idx])
+                        test_x_list.append(all_wx[ts_idx])
+                        test_y_list.append(all_wy[ts_idx])
+
+                    else:  # cross_rep (benchmark standard)
+                        tr_mask  = np.isin(reps, list(TRAIN_REPS))
+                        tst_mask = np.isin(reps, list(TEST_REPS))
+                        mean = emg[tr_mask].mean(axis=0, keepdims=True)
+                        std  = emg[tr_mask].std(axis=0, keepdims=True) + 1e-6
+                        emg  = (emg - mean) / std
+
+                        for is_train, mask in [(True, tr_mask), (False, tst_mask)]:
+                            seg_emg = emg[mask]
+                            seg_lbl = labels[mask]
+                            wx, wy  = [], []
+                            for s in range(0, len(seg_emg) - WINDOW_SIZE + 1, WINDOW_STEP):
+                                w_emg = seg_emg[s:s + WINDOW_SIZE]
+                                w_lbl = seg_lbl[s:s + WINDOW_SIZE]
+                                counts  = np.bincount(w_lbl.astype(np.intp), minlength=18)
+                                maj_lbl = int(np.argmax(counts))
+                                if maj_lbl == 0 or counts[maj_lbl] / WINDOW_SIZE < 0.8:
+                                    continue
+                                wx.append(w_emg.T[np.newaxis].copy())
+                                wy.append(maj_lbl - 1)
+                            if len(wx) > 0:
+                                wx_arr = np.stack(wx, axis=0).astype(np.float32)
+                                wy_arr = np.array(wy, dtype=np.int64)
+                                if is_train:
+                                    per_subject_train_x.append(wx_arr)
+                                    per_subject_train_y.append(wy_arr)
+                                else:
+                                    test_x_list.append(wx_arr)
+                                    test_y_list.append(wy_arr)
+
+                test_x  = np.concatenate(test_x_list, axis=0).reshape(-1, 1, N_EMG_CH, WINDOW_SIZE)
+                test_y  = np.concatenate(test_y_list).reshape(-1, 1).astype(np.int64)
+                train_x = np.concatenate(per_subject_train_x, axis=0)
+                train_y = np.concatenate(per_subject_train_y).reshape(-1, 1).astype(np.int64)
+                print('NinaPro Ex-B loaded: %d train windows, %d test windows, %d subjects, %d classes (split=%s)'
+                      % (len(train_x), len(test_x), n_subjects, N_CLS, self.split))
+
+            if self.dataset not in ['emnist', 'ninapro']:
+                train_itr = train_load.__iter__(); test_itr = test_load.__iter__()
                 # labels are of shape (n_data,)
                 train_x, train_y = train_itr.__next__()
                 test_x, test_y = test_itr.__next__()
@@ -256,19 +373,30 @@ class DatasetObject:
             
             
             elif self.rule == 'iid':
-                
-                client_x = [ np.zeros((client_data_list[client__], self.channels, self.height, self.width)).astype(np.float32) for client__ in range(self.n_client) ]
-                client_y = [ np.zeros((client_data_list[client__], 1)).astype(np.int64) for client__ in range(self.n_client) ]
-            
-                client_data_list_cum_sum = np.concatenate(([0], np.cumsum(client_data_list)))
-                for client_idx_ in range(self.n_client):
-                    client_x[client_idx_] = train_x[client_data_list_cum_sum[client_idx_]:client_data_list_cum_sum[client_idx_+1]]
-                    client_y[client_idx_] = train_y[client_data_list_cum_sum[client_idx_]:client_data_list_cum_sum[client_idx_+1]]
-                
-                client_x = np.asarray(client_x)
-                client_y = np.asarray(client_y)
+                # Truncate to exact multiple of n_client so all clients get equal sizes
+                n_keep = (len(train_y) // self.n_client) * self.n_client
+                train_x = train_x[:n_keep]
+                train_y = train_y[:n_keep]
+                n_data_per_client = n_keep // self.n_client
 
-            
+                client_x = train_x.reshape(self.n_client, n_data_per_client, *train_x.shape[1:])
+                client_y = train_y.reshape(self.n_client, n_data_per_client, *train_y.shape[1:])
+
+            elif self.rule == 'subject':
+                # Each NinaPro subject becomes one FL client.
+                # Subsample to the minimum window count so all clients are balanced.
+                if self.dataset != 'ninapro':
+                    raise ValueError("rule='subject' is only supported for dataset='ninapro'")
+                min_win = min(len(x) for x in per_subject_train_x)
+                np.random.seed(self.seed)
+                client_x_list, client_y_list = [], []
+                for i in range(len(per_subject_train_x)):
+                    idx = np.random.choice(len(per_subject_train_x[i]), min_win, replace=False)
+                    client_x_list.append(per_subject_train_x[i][idx])
+                    client_y_list.append(per_subject_train_y[i][idx].reshape(-1, 1))
+                client_x = np.stack(client_x_list, axis=0)  # (n_client, min_win, 1, 12, 200)
+                client_y = np.stack(client_y_list, axis=0)  # (n_client, min_win, 1)
+
             self.client_x = client_x; self.client_y = client_y
 
             self.test_x  = test_x;  self.test_y  = test_y
@@ -304,6 +432,8 @@ class DatasetObject:
                 self.channels = 1; self.width = 28; self.height = 28; self.n_cls = 10;
             if self.dataset == 'tinyimagenet':
                 self.channels = 3; self.width = 64; self.height = 64; self.n_cls = 200;
+            if self.dataset == 'ninapro':
+                self.channels = 1; self.width = 400; self.height = 12; self.n_cls = 17;
             
             print('data loading finished.')
                 
@@ -388,12 +518,20 @@ class Dataset(torch.utils.data.Dataset):
         elif self.name == 'CIFAR10' or self.name == 'CIFAR100' or self.name == "tinyimagenet":
             self.train = train
             self.transform = transforms.Compose([transforms.ToTensor()])
-            
+
             self.X_data = data_x
             self.y_data = data_y
             if not isinstance(data_y, bool):
                 self.y_data = data_y.astype('float32')
-                
+
+        elif self.name == 'ninapro':
+            # data_x: numpy (N, 1, 12, 200) float32
+            # data_y: numpy (N, 1) int64  or  bool
+            self.X_data = data_x
+            self.y_data = data_y
+            if not isinstance(data_y, bool):
+                self.y_data = data_y.astype('float32')
+
         else:
             raise NotImplementedError
             
@@ -448,9 +586,16 @@ class Dataset(torch.utils.data.Dataset):
                 y = self.y_data[idx]
                 return img, y
 
+        elif self.name == 'ninapro':
+            X = torch.tensor(self.X_data[idx]).float()   # (1, 12, 200)
+            if isinstance(self.y_data, bool):
+                return X
+            y = self.y_data[idx]
+            return X, y
+
         else:
             raise NotImplementedError
-            
+
 class DatasetFromDir(data.Dataset):
 
     def __init__(self, img_root, img_list, label_list, transformer):

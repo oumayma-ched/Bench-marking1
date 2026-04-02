@@ -22,7 +22,11 @@ class Client():
 
         
         self.loss = torch.nn.CrossEntropyLoss(reduction='mean')
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, weight_decay=self.args.weight_decay)
+        # SGD is required for FL: a new Client is instantiated every round,
+        # so any adaptive optimizer (Adam) would lose its momentum state each round,
+        # causing aggressive sign-SGD-like steps and severe client drift.
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr,
+                                         momentum=0.9, weight_decay=self.args.weight_decay)
         self.dataset = data.DataLoader(Dataset(dataset[0], dataset[1], train=True, dataset_name=self.args.dataset), batch_size=self.args.batchsize, shuffle=True)
         
         self.max_norm = 10

@@ -18,10 +18,10 @@ print("##     Federated Learning Simulator Starts     ##")
 print("##=============================================##")
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', choices=['CIFAR10', 'CIFAR100'], type=str, default='CIFAR10')             # select dataset
-parser.add_argument('--model', choices=['LeNet', 'ResNet18'], type=str, default='ResNet18')                # select model
-parser.add_argument('--non-iid', action='store_true', default=False)                                       # activate if use heterogeneous dataset 
-parser.add_argument('--split-rule', choices=['Dirichlet', 'Pathological'], type=str, default='Dirichlet')  # select the dataset splitting rule
+parser.add_argument('--dataset', choices=['CIFAR10', 'CIFAR100', 'ninapro'], type=str, default='CIFAR10')  # select dataset
+parser.add_argument('--model', choices=['LeNet', 'ResNet18', 'EMG_CNN', 'EMG_ATTN', 'CNNATTEN'], type=str, default='ResNet18')     # select model
+parser.add_argument('--non-iid', action='store_true', default=False)                                       # activate if use heterogeneous dataset
+parser.add_argument('--split-rule', choices=['Dirichlet', 'Pathological', 'subject'], type=str, default='Dirichlet')  # select the dataset splitting rule
 parser.add_argument('--split-coef', default=0.6, type=float)                                                  # --> if Dirichlet: select the Dirichlet coefficient (i.e. 0.1, 0.3, 0.6, 1)
                                                                                                               # --> if Pathological: select the Dirichlet coefficient (i.e. 3, 5)
 parser.add_argument('--active-ratio', default=0.1, type=float)                                             # select the partial participating ratio (i.e. 0.1, 0.05)
@@ -34,7 +34,7 @@ parser.add_argument('--local-learning-rate', default=0.1, type=float)           
 parser.add_argument('--global-learning-rate', default=1.0, type=float)                                     # select the global learning rate (generally 1.0 expect for global-adaptive-based)
 parser.add_argument('--lr-decay', default=0.998, type=float)                                               # select the learning rate decay (generally 0.998 expect for proxy-based)
 parser.add_argument('--seed', default=20, type=int)                                                        # select the random seed
-parser.add_argument('--cuda', default=0, type=int)                                                         # select the cuda ID
+parser.add_argument('--cuda', default='0', type=str)                                                       # select the cuda ID, or 'cpu' to force CPU
 parser.add_argument('--data-file', default='./', type=str)                                                 # select the path of the root of Dataset
 parser.add_argument('--out-file', default='out/', type=str)                                                # select the path of the log files
 parser.add_argument('--save-model', action='store_true', default=False)                                    # activate if save the model
@@ -51,6 +51,8 @@ parser.add_argument('--epsilon', default=0.01, type=float)                      
 
 parser.add_argument('--method', choices=['FedAvg', 'FedCM', 'FedDyn', 'SCAFFOLD', 'FedAdam', 'FedProx', 'FedSAM', 'MoFedSAM', \
                                          'FedGamma', 'FedSpeed', 'FedSMOO'], type=str, default='FedAvg')
+parser.add_argument('--random-split', action='store_true', default=False,
+                    help='use random 80/20 split instead of cross-repetition split (ninapro only)')
                                          
 args = parser.parse_args()
 print(args)
@@ -60,20 +62,23 @@ torch.cuda.manual_seed_all(args.seed)
 np.random.seed(args.seed)
 torch.backends.cudnn.deterministic = True
 
-if torch.cuda.is_available():
-    device = torch.device(args.cuda)
+if args.cuda == 'cpu' or not torch.cuda.is_available():
+    device = torch.device('cpu')
+    print("Using CPU for training")
 else:
-    device = torch.device("cpu")
+    device = torch.device('cuda:' + args.cuda)
+    print("Using GPU {:s} for training".format(args.cuda))
 
 if __name__=='__main__':
     ### Generate IID or Heterogeneous Dataset
+    _split = 'random' if getattr(args, 'random_split', False) else 'cross_rep'
     if not args.non_iid:
         data_obj = DatasetObject(dataset=args.dataset, n_client=args.total_client, seed=args.seed, unbalanced_sgm=0, rule='iid',
-                                     data_path=args.data_file)
+                                     data_path=args.data_file, split=_split)
         print("Initialize the Dataset     --->  {:s} {:s} {:d} clients".format(args.dataset, 'IID', args.total_client))
     else:
         data_obj = DatasetObject(dataset=args.dataset, n_client=args.total_client, seed=args.seed, unbalanced_sgm=0, rule=args.split_rule,
-                                     rule_arg=args.split_coef, data_path=args.data_file)
+                                     rule_arg=args.split_coef, data_path=args.data_file, split=_split)
         print("Initialize the Dataset     --->  {:s} {:s}-{:s} {:d} clients".format(args.dataset, args.split_rule, str(args.split_coef), args.total_client))
     
 
@@ -82,6 +87,8 @@ if __name__=='__main__':
         classes = 10
     elif args.dataset == 'CIFAR100':
         classes = 100
+    elif args.dataset == 'ninapro':
+        classes = 17   # NinaPro DB2 Exercise B: 17 gestures (rest discarded, labels 0-16)
     else:
         raise NotImplementedError('not implemented dataset yet')
 
