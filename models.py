@@ -155,7 +155,6 @@ class SE1d(nn.Module):
         return x * w.unsqueeze(2)  # (B, C, T)  channel-wise rescaling
 
 
-
 class client_model(nn.Module):
     def __init__(self, name, n_cls, args=True):
         super(client_model, self).__init__()
